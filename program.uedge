@@ -1,0 +1,5 @@
+import sys
+sys.path.insert(0, 'ply.zip')
+import ply.lex as lex
+
+
