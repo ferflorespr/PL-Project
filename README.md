@@ -7,9 +7,18 @@ Run the command-line entry point with exactly one source file:
 python main.py program.uedge
 ```
 
-The entry point reads the supplied file without prompting. Missing or extra
-arguments and unreadable files produce an error and a nonzero exit status.
-`main.py` contains a collaboration template with owner blanks and TODO sections
-for tokens, the lexer, the common-core PLY.yacc grammar, precision-aware syntax,
-AST/errors, and validation. Only command-line file loading is implemented;
-a successful exit currently means the file was read, not that its syntax is valid.
+The course-grader-compatible entry point is also available:
+
+```sh
+python3 input.py program.uedge
+```
+
+Install the lexer dependency with:
+
+```sh
+python3 -m pip install -r requirements.txt
+```
+
+The entry point reads and tokenizes the supplied file without prompting.
+Missing or extra arguments, unreadable files, and lexical errors produce a
+nonzero exit status. Parsing and syntax validation are still under development.
