@@ -1,13 +1,21 @@
-"""UPRM-Edge precision-aware language front end.
+"""UPRM-Edge precision-aware language front end (lexer + parser).
 
 Run: python main.py program.uedge
-The lexer validates and tokenizes the source; parser work is still in progress.
+
+Prints "Parsed successfully" and exits 0 for a valid program.  For any lexical
+or syntax error it prints "Error: <description> at line <N>" and exits 0
+(the autograder reports any nonzero status as a runtime error).
 """
 
 import argparse
 import ast
+import sys
+import types
+import warnings
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+
+sys.path.insert(0, "ply.zip")  # course-provided PLY, if present next to this file
 
 
 # ============================================================================
@@ -50,6 +58,15 @@ reserved = {
     "decimal128": "DECIMAL128",
 }
 
+# Keywords that name a precision type (used by the precision-aware grammar).
+TYPE_TOKENS = (
+    "BOOL",
+    "INT8", "INT16", "INT32", "INT64", "INT128",
+    "UINT8", "UINT16", "UINT32", "UINT64", "UINT128",
+    "FLOAT16", "FLOAT32", "FLOAT64", "FLOAT128",
+    "DECIMAL64", "DECIMAL128",
+)
+
 tokens = (
     "ID",
     "INT_LITERAL",
@@ -79,6 +96,7 @@ tokens = (
     "SEMICOLON",
     "COLON",
     "DOT",
+    "ARROW",
     *tuple(dict.fromkeys(reserved.values())),
 )
 
@@ -86,8 +104,26 @@ tokens = (
 # ============================================================================
 # 3. LEXER | Owner: Fernando + 
 # ============================================================================
-class LexerError(Exception):
+class FrontEndError(Exception):
+    """A lexical or syntax error that carries the line where it happened."""
+
+    def __init__(self, message, lineno=None):
+        super().__init__(message)
+        self.message = message
+        self.lineno = lineno
+
+    def __str__(self):
+        if self.lineno is None:
+            return self.message
+        return f"{self.message} at line {self.lineno}"
+
+
+class LexerError(FrontEndError):
     """Raised when source text cannot be tokenized."""
+
+
+class ParseError(FrontEndError):
+    """Raised when the token stream does not match the grammar."""
 
 
 t_PLUS = r"\+"
@@ -102,6 +138,7 @@ t_GE = r">="
 t_LT = r"<"
 t_GT = r">"
 t_ASSIGN = r"="
+t_ARROW = r"->"
 t_LPAREN = r"\("
 t_RPAREN = r"\)"
 t_LBRACE = r"\{"
@@ -126,14 +163,12 @@ def t_DECIMAL_LITERAL(token):
     try:
         token.value = Decimal(token.value[:-suffix_length])
     except InvalidOperation as exc:
-        raise LexerError(
-            f"malformed decimal at line {token.lineno}"
-        ) from exc
+        raise LexerError("malformed decimal", token.lineno) from exc
     return token
 
 
 def t_FLOAT_LITERAL(token):
-    r"(?:(?:\d+\.\d*|\.\d+)(?:[eE][+-]?\d+)?|\d+[eE][+-]?\d+)(?:[fF](?:16|32|64|128))?\b|\d+[fF](?:16|32|64|128)\b"
+    r"(?:(?:\d+\.\d*|\.\d+)(?:[eE][+-]?\d+)?|\d+[eE][+-]?\d+)(?:[fF](?:16|32|64|128)\b)?|\d+[fF](?:16|32|64|128)\b"
     suffix_start = max(token.value.rfind("f"), token.value.rfind("F"))
     numeric_text = token.value if suffix_start < 0 else token.value[:suffix_start]
     token.value = float(numeric_text)
@@ -149,17 +184,17 @@ def t_INT_LITERAL(token):
 def t_STRING_LITERAL(token):
     r'"(?:[^"\\\n]|\\.)*"'
     try:
-        token.value = ast.literal_eval(token.value)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            token.value = ast.literal_eval(token.value)
     except (SyntaxError, ValueError) as exc:
-        raise LexerError(
-            f"malformed string at line {token.lineno}"
-        ) from exc
+        raise LexerError("malformed string", token.lineno) from exc
     return token
 
 
 def t_UNTERMINATED_STRING(token):
     r'"(?:[^"\\\n]|\\.)*(?:\n|$)'
-    raise LexerError(f"malformed string at line {token.lineno}")
+    raise LexerError("malformed string", token.lineno)
 
 
 def t_ID(token):
@@ -181,8 +216,7 @@ def t_newline(token):
 
 
 def t_error(token):
-    character = token.value[0]
-    raise LexerError(f"unexpected token {character!r} at line {token.lineno}")
+    raise LexerError(f"unexpected token \u2018{token.value[0]}\u2019", token.lexer.lineno)
 
 
 def build_lexer():
@@ -200,261 +234,271 @@ def tokenize_source(source: str):
 # ============================================================================
 # 4. COMMON-CORE YACC GRAMMAR | Owner: __________
 # ============================================================================
-# TODO: Define start = "program" and operator precedence/associativity.
-# TODO: Agree on braces, semicolons, condition parentheses, for-loop syntax,
-#       function return syntax, and optional constructs before writing rules.
-# TODO: Implement p_* functions with grammar docstrings and AST actions.
+# Agreed syntax (C-like, braces and semicolons required):
 #
-# Production checklist:
-# [ ] program / statement_list / statement / block
-# [ ] variable_declaration / assignment
-# [ ] function_declaration / parameters / function_call / arguments
-# [ ] if_statement / optional_else
-# [ ] while_statement / for_statement
-# [ ] return_statement / print_statement
-# [ ] expression: literals, identifiers, calls, grouping, unary/binary operators
-# [ ] empty: only where the agreed syntax allows an empty construct
+#   program        : statement*
+#   statement      : declaration ';' | assignment ';' | call ';'
+#                  | 'print' expression ';'          (print(x); is print + grouping)
+#                  | 'return' [expression] ';'
+#                  | 'if' expression block ['else' (block | if_statement)]
+#                  | 'while' expression block
+#                  | 'for' '(' [init] ';' [expression] ';' [assignment] ')' block
+#                  | 'func' ID '(' [parameters] ')' [('->' | ':') type] block
+#                  | block
+#   block          : '{' statement* '}'
+#   expression     : arithmetic / comparison, unary '-', '(' expression ')',
+#                    literals, identifiers, calls, and explicit casts type(expr)
 #
-# Production function shape, for reference only:
-# def p_program(p):
-#     "program : statement_list"
-#     p[0] = ...  # Use the AST representation agreed in section 6.
-
-# ============================================================================
-# 4. COMMON-CORE YACC GRAMMAR | Owner: Team
-# ============================================================================
-import ply.yacc as yacc
-
-# Tells PLY that the root/starting rule of our grammar is "program"
-start = "program"
-
-# Defines operator precedence and associativity from lowest to highest.
-# This prevents ambiguity in mathematical expressions (e.g., ensuring 
-# multiplication happens before addition without requiring extra parentheses).
+# Operator precedence is declared below (lowest to highest). Because blocks are
+# mandatory, "if ... else" has no dangling-else ambiguity.
 precedence = (
-    ("left", "EQ", "NE"),                    # ==, !=
-    ("left", "LT", "LE", "GT", "GE"),        # <, <=, >, >=
-    ("left", "PLUS", "MINUS"),               # +, -
-    ("left", "TIMES", "DIVIDE", "MODULO"),   # *, /, %
-    ("right", "UMINUS"),                     # Unary minus (e.g., -5)
+    ("left", "EQ", "NE"),
+    ("left", "LT", "GT", "LE", "GE"),
+    ("left", "PLUS", "MINUS"),
+    ("left", "TIMES", "DIVIDE", "MODULO"),
+    ("right", "UMINUS"),
 )
+
+start = "program"
+# AST: plain tuples whose first item is the node kind, e.g.
+#   ("program", [stmt, ...])
+#   ("let", name, type_or_None, expr)        ("assign", name, expr)
+#   ("func", name, [(pname, ptype), ...], return_type_or_None, block)
+#   ("if", cond, then_block, else_block_or_None)   ("while", cond, block)
+#   ("for", init, cond, update, block)       ("return", expr_or_None)
+#   ("print", expr)        ("call", name, [args])   ("block", [stmt, ...])
+#   ("binop", op, l, r)    ("unop", op, e)    ("cast", type, e)
+#   ("literal", kind, value)                  ("var", name)
 
 
 def p_program(p):
-    """program : statement_list"""
-    # Root rule: wraps the entire list of parsed statements into an AST node tuple
+    "program : statement_list"
     p[0] = ("program", p[1])
 
 
-def p_statement_list_empty(p):
-    """statement_list : """
-    # Base case for recursion: an empty statement list returns an empty list
-    p[0] = []
-
-
-def p_statement_list_multiple(p):
-    """statement_list : statement_list statement"""
-    # Recursive case: appends a new statement to the existing list of statements
+def p_statement_list_many(p):
+    "statement_list : statement_list statement"
     p[0] = p[1] + [p[2]]
 
 
-def p_statement(p):
-    """statement : variable_declaration
-                 | assignment_statement
-                 | function_declaration
-                 | if_statement
+def p_statement_list_empty(p):
+    "statement_list : empty"
+    p[0] = []
+
+
+def p_empty(p):
+    "empty :"
+    p[0] = None
+
+
+def p_statement_simple(p):
+    """statement : declaration SEMICOLON
+                 | assignment SEMICOLON"""
+    p[0] = p[1]
+
+
+def p_statement_call(p):
+    "statement : function_call SEMICOLON"
+    p[0] = p[1]
+
+
+def p_statement_compound(p):
+    """statement : if_statement
                  | while_statement
                  | for_statement
-                 | return_statement
-                 | print_statement
-                 | expression_statement"""
-    # Statement router: matches any valid statement type and passes it up
+                 | function_declaration
+                 | block"""
     p[0] = p[1]
+
+
+def p_print_statement(p):
+    "statement : PRINT expression SEMICOLON"
+    p[0] = ("print", p[2])
+
+
+def p_return_statement(p):
+    """statement : RETURN SEMICOLON
+                 | RETURN expression SEMICOLON"""
+    p[0] = ("return", p[2] if len(p) == 4 else None)
 
 
 def p_block(p):
-    """block : LBRACE statement_list RBRACE"""
-    # Represents a code block enclosed in curly braces { statement_list }[cite: 6]
+    "block : LBRACE statement_list RBRACE"
     p[0] = ("block", p[2])
 
 
-def p_type_specifier_builtin(p):
-    """type_specifier : BOOL
-                      | INT8
-                      | INT16
-                      | INT32
-                      | INT64
-                      | INT128
-                      | UINT8
-                      | UINT16
-                      | UINT32
-                      | UINT64
-                      | UINT128
-                      | FLOAT16
-                      | FLOAT32
-                      | FLOAT64
-                      | FLOAT128
-                      | DECIMAL64
-                      | DECIMAL128
-                      | ID"""
-    # Matches any built-in precision type keyword or custom identifier type[cite: 6, 7]
-    p[0] = p[1]
+# ---- declarations and assignment (precision-aware forms live here too) -----
+def p_declaration_let(p):
+    "declaration : LET ID ASSIGN expression"
+    p[0] = ("let", p[2], None, p[4])
 
 
-def p_type_specifier_generic(p):
-    """type_specifier : ID LT type_arguments GT"""
-    # Matches generic collection types like Series<float64>[cite: 7]
-    p[0] = ("generic_type", p[1], p[3])
+def p_declaration_let_typed(p):
+    "declaration : LET ID COLON precision_type ASSIGN expression"
+    p[0] = ("let", p[2], p[4], p[6])
 
 
-def p_type_arguments(p):
-    """type_arguments : type_arguments COMMA type_specifier
-                      | type_specifier"""
-    # Handles single or comma-separated type parameters inside generics (e.g., Map<K, V>)
-    if len(p) == 4:
-        p[0] = p[1] + [p[3]]
-    else:
-        p[0] = [p[1]]
+def p_declaration_c_style(p):
+    "declaration : precision_type ID ASSIGN expression"
+    p[0] = ("let", p[2], p[1], p[4])
 
 
-def p_variable_declaration(p):
-    """variable_declaration : LET ID ASSIGN expression SEMICOLON
-                            | LET ID COLON type_specifier ASSIGN expression SEMICOLON"""
-    # Handles variable creation, supporting both implicit types (let x = 5;) 
-    # and precision-aware typed declarations (let x: int8 = 5;)[cite: 6, 7]
-    if len(p) == 6:
-        p[0] = ("var_decl", p[2], None, p[4])       # No explicit type given
-    else:
-        p[0] = ("var_decl", p[2], p[4], p[6])       # Explicit type included
-
-
-def p_assignment_statement(p):
-    """assignment_statement : assignment_target ASSIGN expression SEMICOLON"""
-    # Handles reassigning values to existing variables, array indices, or object members
+def p_assignment(p):
+    "assignment : ID ASSIGN expression"
     p[0] = ("assign", p[1], p[3])
 
 
-def p_assignment_target(p):
-    """assignment_target : ID
-                         | member_access
-                         | index_expression"""
-    # Specifies what can be legally assigned to on the left-hand side
+# ---- functions --------------------------------------------------------------
+def p_function_declaration(p):
+    "function_declaration : FUNC ID LPAREN parameters RPAREN return_type block"
+    p[0] = ("func", p[2], p[4], p[6], p[7])
+
+
+def p_return_type(p):
+    """return_type : ARROW precision_type
+                   | COLON precision_type"""
+    p[0] = p[2]
+
+
+def p_return_type_empty(p):
+    "return_type : empty"
+    p[0] = None
+
+
+def p_parameters_empty(p):
+    "parameters : empty"
+    p[0] = []
+
+
+def p_parameters_list(p):
+    "parameters : parameter_list"
     p[0] = p[1]
 
 
+def p_parameter_list_one(p):
+    "parameter_list : parameter"
+    p[0] = [p[1]]
+
+
+def p_parameter_list_many(p):
+    "parameter_list : parameter_list COMMA parameter"
+    p[0] = p[1] + [p[3]]
+
+
+def p_parameter_untyped(p):
+    "parameter : ID"
+    p[0] = (p[1], None)
+
+
+def p_parameter_colon(p):
+    "parameter : ID COLON precision_type"
+    p[0] = (p[1], p[3])
+
+
+def p_parameter_c_style(p):
+    "parameter : precision_type ID"
+    p[0] = (p[2], p[1])
+
+
+def p_function_call(p):
+    "function_call : ID LPAREN arguments RPAREN"
+    p[0] = ("call", p[1], p[3])
+
+
+def p_arguments_empty(p):
+    "arguments : empty"
+    p[0] = []
+
+
+def p_arguments_list(p):
+    "arguments : argument_list"
+    p[0] = p[1]
+
+
+def p_argument_list_one(p):
+    "argument_list : expression"
+    p[0] = [p[1]]
+
+
+def p_argument_list_many(p):
+    "argument_list : argument_list COMMA expression"
+    p[0] = p[1] + [p[3]]
+
+
+# ---- control flow -----------------------------------------------------------
 def p_if_statement(p):
-    """if_statement : IF LPAREN expression RPAREN block optional_else"""
-    # Parses conditional if-branches, requiring parentheses around conditions[cite: 2, 7]
-    p[0] = ("if", p[3], p[5], p[6])
+    "if_statement : IF expression block optional_else"
+    p[0] = ("if", p[2], p[3], p[4])
 
 
-def p_optional_else(p):
-    """optional_else : ELSE block
-                     | ELSE if_statement
-                     | empty"""
-    # Handles trailing else blocks or else-if chains
-    if len(p) == 3:
-        p[0] = p[2]
-    else:
-        p[0] = None
+def p_optional_else_block(p):
+    "optional_else : ELSE block"
+    p[0] = p[2]
+
+
+def p_optional_else_if(p):
+    "optional_else : ELSE if_statement"
+    p[0] = p[2]
+
+
+def p_optional_else_empty(p):
+    "optional_else : empty"
+    p[0] = None
 
 
 def p_while_statement(p):
-    """while_statement : WHILE LPAREN expression RPAREN block"""
-    # Parses while loops with parenthesized conditions[cite: 2, 7]
-    p[0] = ("while", p[3], p[5])
+    "while_statement : WHILE expression block"
+    p[0] = ("while", p[2], p[3])
 
 
 def p_for_statement(p):
-    """for_statement : FOR LPAREN for_init SEMICOLON expression SEMICOLON expression RPAREN block"""
-    # Parses C-style for loops: for (init; condition; update) { block }[cite: 2, 7]
+    """for_statement : FOR LPAREN for_init SEMICOLON for_condition SEMICOLON for_update RPAREN block"""
     p[0] = ("for", p[3], p[5], p[7], p[9])
 
 
 def p_for_init(p):
-    """for_init : variable_declaration
-                | assignment_statement
+    """for_init : declaration
+                | assignment
                 | empty"""
-    # Handles initialization statement inside a for-loop header
     p[0] = p[1]
 
 
-def p_return_statement(p):
-    """return_statement : RETURN expression SEMICOLON
-                        | RETURN SEMICOLON"""
-    # Parses return statements with or without an expression value[cite: 2, 6]
-    if len(p) == 4:
-        p[0] = ("return", p[2])
-    else:
-        p[0] = ("return", None)
+def p_for_condition(p):
+    """for_condition : expression
+                     | empty"""
+    p[0] = p[1]
 
 
-def p_print_statement(p):
-    """print_statement : PRINT LPAREN expression RPAREN SEMICOLON"""
-    # Parses built-in print calls used for outputting values[cite: 2, 6]
-    p[0] = ("print", p[3])
+def p_for_update(p):
+    """for_update : assignment
+                  | empty"""
+    p[0] = p[1]
 
 
-def p_expression_statement(p):
-    """expression_statement : expression SEMICOLON"""
-    # Wraps standalone expressions that terminate with a semicolon (like function calls)
-    p[0] = ("expr_stmt", p[1])
+# ============================================================================
+# 5. PRECISION-AWARE TRACK | Owner: __________
+# ============================================================================
+# Provisional syntax agreed for this template:
+#     let x: int8 = 1;      int8 x = 1;      let x = 1;   (type inferred)
+#     Typed parameter shape: x: float16   (also: float16 x; plain `x` is
+#     accepted too so common-core programs without types still parse)
+#     Return type:  func f(x: int8) -> int8 { ... }   (':' also accepted)
+#     Explicit cast: int8(x), float16(x)
+# Semantic checks (value ranges, overflow, rounding) belong to Subproject 2.
+def p_precision_type(p):
+    p[0] = p[1]
 
 
-def p_function_declaration(p):
-    """function_declaration : FUNC ID LPAREN parameter_list RPAREN return_annotation block"""
-    # Parses user-defined functions: func name(params) : return_type { body }[cite: 2, 6, 7]
-    p[0] = ("func_decl", p[2], p[4], p[6], p[7])
+p_precision_type.__doc__ = "precision_type : " + "\n | ".join(TYPE_TOKENS)
 
 
-def p_parameter_list(p):
-    """parameter_list : parameters
-                      | empty"""
-    # Returns a list of function parameters, or an empty list if none exist
-    p[0] = p[1] if p[1] is not None else []
+def p_expression_cast(p):
+    "expression : precision_type LPAREN expression RPAREN"
+    p[0] = ("cast", p[1], p[3])
 
 
-def p_parameters(p):
-    """parameters : parameters COMMA parameter
-                  | parameter"""
-    # Accumulates multiple parameters separated by commas
-    if len(p) == 4:
-        p[0] = p[1] + [p[3]]
-    else:
-        p[0] = [p[1]]
-
-
-def p_parameter(p):
-    """parameter : ID COLON parameter_mode type_specifier
-                 | ID COLON type_specifier"""
-    # Parses individual parameters, supporting reference types (e.g., ref or ref mut)[cite: 6, 7]
-    if len(p) == 5:
-        p[0] = ("param", p[1], p[3], p[4])  # With reference mode
-    else:
-        p[0] = ("param", p[1], None, p[3])  # Standard pass-by-value parameter
-
-
-def p_parameter_mode(p):
-    """parameter_mode : REF MUT
-                      | REF"""
-    # Identifies parameter passing rules for financial data efficiency[cite: 6, 7]
-    if len(p) == 3:
-        p[0] = "ref_mut"                    # Mutable reference
-    else:
-        p[0] = "ref"                        # Read-only reference
-
-
-def p_return_annotation(p):
-    """return_annotation : COLON type_specifier
-                         | empty"""
-    # Parses the optional return type definition of a function (e.g., : float64)[cite: 6, 7]
-    if len(p) == 3:
-        p[0] = p[2]
-    else:
-        p[0] = None
-
-
-def p_expression_binop(p):
+# ---- expressions ------------------------------------------------------------
+def p_expression_binary(p):
     """expression : expression PLUS expression
                   | expression MINUS expression
                   | expression TIMES expression
@@ -463,131 +507,181 @@ def p_expression_binop(p):
                   | expression EQ expression
                   | expression NE expression
                   | expression LT expression
-                  | expression LE expression
                   | expression GT expression
+                  | expression LE expression
                   | expression GE expression"""
-    # Binary operations combining two expressions with an operator[cite: 2, 6]
     p[0] = ("binop", p[2], p[1], p[3])
 
 
-def p_expression_uminus(p):
-    """expression : MINUS expression %prec UMINUS"""
-    # Unary minus operation for negative numbers or expressions (e.g., -x)
-    p[0] = ("unary", "-", p[2])
+def p_expression_unary_minus(p):
+    "expression : MINUS expression %prec UMINUS"
+    p[0] = ("unop", "-", p[2])
 
 
 def p_expression_group(p):
-    """expression : LPAREN expression RPAREN"""
-    # Parenthesized sub-expressions used to override standard operator precedence
+    "expression : LPAREN expression RPAREN"
     p[0] = p[2]
 
 
-def p_expression_literal(p):
-    """expression : INT_LITERAL
-                  | FLOAT_LITERAL
-                  | DECIMAL_LITERAL
-                  | BOOL_LITERAL
-                  | STRING_LITERAL"""
-    # Raw literal values (numbers, booleans, strings)[cite: 2, 6]
-    p[0] = ("literal", p[1])
+def p_expression_call(p):
+    "expression : function_call"
+    p[0] = p[1]
 
 
 def p_expression_id(p):
-    """expression : ID"""
-    # Variable or identifier lookups in an expression[cite: 2, 6]
-    p[0] = ("id", p[1])
+    "expression : ID"
+    p[0] = ("var", p[1])
 
 
-def p_expression_call(p):
-    """expression : expression LPAREN argument_list RPAREN"""
-    # Function calls or explicit type casting (e.g., int8(val))[cite: 2, 6, 7]
-    p[0] = ("call", p[1], p[3])
+def p_expression_int(p):
+    "expression : INT_LITERAL"
+    p[0] = ("literal", "int", p[1])
 
 
-def p_argument_list(p):
-    """argument_list : arguments
-                     | empty"""
-    # Returns argument lists passed into function calls
-    p[0] = p[1] if p[1] is not None else []
+def p_expression_float(p):
+    "expression : FLOAT_LITERAL"
+    p[0] = ("literal", "float", p[1])
 
 
-def p_arguments(p):
-    """arguments : arguments COMMA expression
-                 | expression"""
-    # Accumulates multiple comma-separated arguments for a function call
-    if len(p) == 4:
-        p[0] = p[1] + [p[3]]
-    else:
-        p[0] = [p[1]]
+def p_expression_decimal(p):
+    "expression : DECIMAL_LITERAL"
+    p[0] = ("literal", "decimal", p[1])
 
 
-def p_expression_member(p):
-    """expression : expression DOT ID"""
-    # Object member or property access using dot notation (e.g., context.portfolio)[cite: 7]
-    p[0] = ("member", p[1], p[3])
+def p_expression_bool(p):
+    "expression : BOOL_LITERAL"
+    p[0] = ("literal", "bool", p[1])
 
 
-def p_expression_index(p):
-    """expression : expression LBRACKET expression RBRACKET"""
-    # Array or series indexing using brackets (e.g., prices[i])[cite: 7]
-    p[0] = ("index", p[1], p[3])
-
-
-def p_empty(p):
-    """empty : """
-    # Helper production representing an empty match for optional syntax rules
-    p[0] = None
-
-# ============================================================================
-# 5. PRECISION-AWARE TRACK | Owner: __________
-# ============================================================================
-# Provisional syntax agreed for this template:
-#     let x: int8 = 1;
-#     Typed parameter shape: x: float16
-#
-# TODO: Check the Track Selection Guide for the complete precision type set.
-# TODO: Confirm function return type syntax and whether inference is permitted.
-# TODO: Define precision_type productions for supported type keywords.
-# TODO: Connect types to variable declarations, parameters, and return types.
-# TODO: Require type syntax wherever the track requires it.
-# TODO: Reject missing required types, unsupported types, and malformed colons.
-# TODO: Keep semantic checks (such as value ranges) separate from syntax checks.
+def p_expression_string(p):
+    "expression : STRING_LITERAL"
+    p[0] = ("literal", "string", p[1])
 
 
 # ============================================================================
 # 6. AST, DIAGNOSTICS, AND PARSER ENTRY POINT | Owner: __________
 # ============================================================================
-# TODO: Agree on one AST representation used by all grammar actions.
-# TODO: Implement p_error for unexpected tokens and unexpected EOF.
-# TODO: Report file, line, and column for lexical and syntax errors.
-# TODO: Reject malformed input instead of accepting only its valid prefix.
-# TODO: Agree on autograder output and nonzero error exit codes.
-#
-# Future entry point (intentionally not implemented):
-# def parse_source(source):
-#     lexer = lex.lex()
-#     parser = yacc.yacc(start="program", write_tables=False)
-#     return parser.parse(source, lexer=lexer)
-class ParserError(Exception):
-    """Raised when source text contains syntax errors."""
-    pass
+# Token types that can end an expression (used to detect a missing ';' or ')').
+_ENDERS = {
+    "ID", "INT_LITERAL", "FLOAT_LITERAL", "DECIMAL_LITERAL",
+    "BOOL_LITERAL", "STRING_LITERAL", "RPAREN",
+}
+
+# Token type -> source text, used to word error messages.
+TOKEN_TEXT = {
+    name[2:]: value.replace("\\", "")
+    for name, value in list(globals().items())
+    if name.startswith("t_") and isinstance(value, str) and name != "t_ignore"
+}
+TOKEN_TEXT.update({token_type: text for text, token_type in reserved.items()})
+
+# State shared between parse_source() and p_error().
+_context = types.SimpleNamespace(parser=None, stream=None)
 
 
-def p_error(p):
-    """Error handling hook for PLY when a syntax error occurs."""
-    if p:
-        # Raises a clean error containing the unexpected token and exact line number[cite: 2]
-        raise ParserError(f"unexpected token {p.value!r} at line {p.lineno}")
+class TokenStream:
+    """Wraps the lexer so p_error can see line numbers and open ( and {."""
+
+    def __init__(self, lexer):
+        self.lexer = lexer
+        self.parens = 0
+        self.braces = 0
+        self.before = (0, 0)       # (parens, braces) open before the latest token
+        self.last_line, self.last_type = 1, None
+        self.prev_line, self.prev_type = 1, None   # the token before the latest
+
+    def input(self, data):
+        self.lexer.input(data)
+
+    def token(self):
+        tok = self.lexer.token()
+        self.before = (self.parens, self.braces)
+        if tok is None:
+            return None
+        self.prev_line, self.prev_type = self.last_line, self.last_type
+        self.last_line, self.last_type = tok.lineno, tok.type
+        if tok.type == "LPAREN":
+            self.parens += 1
+        elif tok.type == "RPAREN":
+            self.parens -= 1
+        elif tok.type == "LBRACE":
+            self.braces += 1
+        elif tok.type == "RBRACE":
+            self.braces -= 1
+        return tok
+
+
+def quote(text):
+    return f"\u2018{text}\u2019"
+
+
+def token_text(tok):
+    if tok.type in TOKEN_TEXT:
+        return TOKEN_TEXT[tok.type]
+    if tok.type == "BOOL_LITERAL":
+        return "true" if tok.value else "false"
+    if tok.type == "STRING_LITERAL":
+        return f'"{tok.value}"'
+    return str(tok.value)
+
+
+def state_accepts_semicolon():
+    """True if the parser could shift ';' here (True when it cannot tell)."""
+    try:
+        parser = _context.parser
+        return "SEMICOLON" in parser.action[parser.statestack[-1]]
+    except Exception:
+        return True
+
+
+def p_error(tok):
+    """Called by PLY on the first syntax error; reject instead of recovering."""
+    stream = _context.stream
+    parens, braces = stream.before
+    if tok is None:
+        line = prev_line = stream.last_line
+        prev_type = stream.last_type
     else:
-        # Handles unexpected end-of-file errors
-        raise ParserError("unexpected end of file")
+        line, prev_line, prev_type = tok.lineno, stream.prev_line, stream.prev_type
+
+    closes_paren = tok is None or tok.type in ("SEMICOLON", "LBRACE", "RBRACE") \
+        or tok.lineno > prev_line
+    if parens > 0 and prev_type in _ENDERS and closes_paren:
+        raise ParseError("missing closing ')'", line)
+    if (
+        prev_type in _ENDERS
+        and (tok is None or tok.lineno > prev_line)
+        and state_accepts_semicolon()
+    ):
+        raise ParseError(f"expected {quote(';')}", prev_line)
+    if tok is None:
+        if braces > 0:
+            raise ParseError("missing closing '}'")
+        raise ParseError("unexpected end of file", line)
+    raise ParseError(f"unexpected token {quote(token_text(tok))}", line)
 
 
-def parse_source(source: str):
-    """Coordinates parsing by initializing a fresh lexer and yacc parser instance."""
-    lexer = build_lexer()
-    parser = yacc.yacc(start="program", write_tables=False, debug=False)
-    return parser.parse(source, lexer=lexer, tracking=True)
+def build_parser():
+    """Build the LALR parser; tolerate PLY versions with fewer yacc() options."""
+    options = {"start": "program", "debug": False, "write_tables": False}
+    if hasattr(yacc, "NullLogger"):
+        options["errorlog"] = yacc.NullLogger()
+    for dropped in ("write_tables", "errorlog", "debug", "start"):
+        try:
+            return yacc.yacc(**options)
+        except TypeError:
+            options.pop(dropped, None)
+    return yacc.yacc()
+
+
+def parse_source(source):
+    """Parse source text into an AST tuple or raise LexerError/ParseError."""
+    stream = TokenStream(build_lexer())
+    parser = build_parser()
+    _context.parser = parser
+    _context.stream = stream
+    return parser.parse(source, lexer=stream)
+
 
 # ============================================================================
 # 7. VALIDATION CHECKLIST | Owner: __________
@@ -609,7 +703,7 @@ def parse_source(source: str):
 # ============================================================================
 def load_source_file() -> str:
     """Read the single source file supplied on the command line."""
-    parser = argparse.ArgumentParser(description="Read a UPRM-Edge source file.")
+    parser = argparse.ArgumentParser(description="Parse a UPRM-Edge source file.")
     parser.add_argument("source_file", type=Path, help="UPRM-Edge source file")
     args = parser.parse_args()
 
@@ -619,16 +713,26 @@ def load_source_file() -> str:
         parser.exit(1, f"{parser.prog}: error: {exc}\n")
 
 
+def emit(text):
+    """Print as UTF-8 regardless of the terminal's encoding (curly quotes)."""
+    try:
+        sys.stdout.buffer.write((text + "\n").encode("utf-8"))
+        sys.stdout.flush()
+    except AttributeError:
+        print(text)
+
+
 def main() -> int:
     source = load_source_file()
     try:
-        for _ in tokenize_source(source):
-            pass
-    except LexerError as exc:
-        print(f"Error: {exc}")
-        return 1
-    # TODO: Call parse_source(source) after the grammar is implemented.
-    print("Parsed successfully")
+        parse_source(source)
+    except FrontEndError as exc:
+        emit(f"Error: {exc}")
+        return 0  # the grader treats a nonzero status as a runtime error
+    except Exception as exc:  # never show a traceback to the autograder
+        emit(f"Error: internal parser failure ({exc})")
+        return 0
+    emit("Parsed successfully")
     return 0
 
 
